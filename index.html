@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>미니 크래프트 - 오프라인</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000;font-family:'Segoe UI',Arial,sans-serif;user-select:none;}
+  #glcanvas{display:block;width:100vw;height:100vh;cursor:crosshair;}
+  #crosshair{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);color:#fff;font-size:22px;pointer-events:none;text-shadow:0 0 3px #000;}
+  #hotbar{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);display:flex;gap:4px;padding:5px;background:rgba(0,0,0,.45);border-radius:6px;}
+  .slot{width:44px;height:44px;border:2px solid #555;border-radius:4px;background:rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;position:relative;}
+  .slot.sel{border-color:#fff;box-shadow:0 0 6px #fff;}
+  .slot canvas{width:36px;height:36px;image-rendering:pixelated;}
+  .slot span{position:absolute;right:2px;bottom:1px;color:#ddd;font-size:10px;}
+  #overlay{position:fixed;inset:0;background:rgba(10,20,30,.82);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10;cursor:pointer;}
+  #overlay h1{font-size:52px;margin:0 0 6px;color:#7ec850;text-shadow:3px 3px 0 #3a5f22;}
+  #overlay p{margin:4px 0;font-size:16px;color:#cfe8f7;}
+  #overlay .small{font-size:13px;color:#9ab;}
+  #overlay .play{margin-top:22px;padding:12px 40px;font-size:20px;background:#4caf50;color:#fff;border:none;border-radius:8px;cursor:pointer;}
+  #overlay.hidden{display:none;}
+  #info{position:fixed;top:8px;left:8px;color:#fff;font-size:12px;text-shadow:1px 1px 2px #000;pointer-events:none;}
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<div id="crosshair">+</div>
+<div id="hotbar"></div>
+<div id="info"></div>
+<div id="overlay">
+  <h1>미니 크래프트</h1>
+  <p>오프라인 브라우저 복셀 게임</p>
+  <p class="small">이동: W A S D &nbsp;|&nbsp; 점프: Space &nbsp;|&nbsp; 질주: Shift</p>
+  <p class="small">설치: 마우스 오른쪽 &nbsp;|&nbsp; 파괴: 마우스 왼쪽</p>
+  <p class="small">블록 선택: 1~9 또는 마우스 휠 &nbsp;|&nbsp; 비행: F</p>
+  <button class="play" id="playBtn">클릭해서 시작</button>
+</div>
+<script>
+'use strict';
+// ==================== 상수 ====================
+const W = 128, H = 48, WATER = 13;
+const CS = 16, CX = W / CS;
+const REACH = 6;
+const SEED = 1337;
+
+// ==================== 블록 정의 ====================
+// tiles: [top, side, bottom]
+const BLOCKS = {
+  1:{name:'잔디',    tiles:[0,1,2]},
+  2:{name:'흙',      tiles:[2,2,2]},
+  3:{name:'돌',      tiles:[3,3,3]},
+  4:{name:'조약돌',  tiles:[4,4,4]},
+  5:{name:'나무판자',tiles:[5,5,5]},
+  6:{name:'원목',    tiles:[7,6,7]},
+  7:{name:'나뭇잎',  tiles:[8,8,8]},
+  8:{name:'모래',    tiles:[9,9,9]},
+  9:{name:'물',      tiles:[10,10,10], fluid:true},
+  10:{name:'벽돌',   tiles:[11,11,11]},
+};
+const HOTBAR = [1,2,3,4,5,6,7,8,10];
+
+// ==================== 월드 데이터 ====================
+const world = new Uint8Array(W * H * W);
+function idx(x,y,z){ return x + z * W + y * W * W; }
+function getBlock(x,y,z){
+  if(x<0||x>=W||y<0||y>=H||z<0||z>=W) return 0;
+  return world[idx(x,y,z)];
+}
+function solidAt(x,y,z){
+  if(y < 0) return true;
+  if(x<0||x>=W||z<0||z>=W||y>=H) return true;
+  const b = world[idx(x,y,z)];
+  return b !== 0 && b !== 9;
+}
+
+// ==================== 노이즈 ====================
+function hash2(x,z){
+  let n = Math.imul(x,374761393) ^ Math.imul(z,668265263) ^ SEED;
+  n = Math.imul(n ^ (n>>>13), 1274126177);
+  n ^= n>>>16;
+  return (n>>>0) / 4294967296;
+}
+function valueNoise(x,z){
+  const xi = Math.floor(x), zi = Math.floor(z);
+  const xf = x-xi, zf = z-zi;
+  const u = xf*xf*(3-2*xf), v = zf*zf*(3-2*zf);
+  const a = hash2(xi,zi), b = hash2(xi+1,zi), c = hash2(xi,zi+1), d = hash2(xi+1,zi+1);
+  return a + (b-a)*u + (c-a)*v + (a-b-c+d)*u*v;
+}
+function fbm(x,z){
+  let sum=0, amp=1, f=1, tot=0;
+  for(let i=0;i<4;i++){ sum += valueNoise(x*f,z*f)*amp; tot+=amp; amp*=0.5; f*=2; }
+  return sum/tot;
+}
+
+// ==================== 지형 생성 ====================
+function generateWorld(){
+  const heights = new Int16Array(W*W);
+  for(let z=0; z<W; z++){
+    for(let x=0; x<W; x++){
+      const e = fbm(x*0.016, z*0.016);
+      const m = fbm(x*0.004+512, z*0.004+512);
+      let h = Math.floor(6 + e*20 + Math.pow(Math.max(0,m-0.55)*2.4,2)*24);
+      h = Math.max(2, Math.min(H-10, h));
+      heights[x+z*W] = h;
+      for(let y=0; y<=h; y++){
+        let b;
+        if(y===0) b = 3;
+        else if(y < h-3) b = 3;
+        else if(y < h) b = 2;
+        else b = (h < WATER+2) ? 8 : 1;
+        world[idx(x,y,z)] = b;
+      }
+      for(let y=h+1; y<=WATER; y++) world[idx(x,y,z)] = 9;
+    }
+  }
+  // 나무 생성
+  for(let z=3; z<W-3; z++){
+    for(let x=3; x<W-3; x++){
+      const h = heights[x+z*W];
+      if(world[idx(x,h,z)] !== 1) continue;
+      if(hash2(x*7+13, z*7+29) > 0.006) continue;
+      const th = 4 + ((hash2(x,z)*2)|0);
+      if(h+th+2 >= H) continue;
+      for(let dy=1; dy<=th; dy++) world[idx(x,h+dy,z)] = 6;
+      for(let dy=th-2; dy<=th+1; dy++){
+        const r = dy >= th ? 1 : 2;
+        for(let dx=-r; dx<=r; dx++){
+          for(let dz=-r; dz<=r; dz++){
+            if(dx===0 && dz===0 && dy<=th) continue;
+            if(Math.abs(dx)===r && Math.abs(dz)===r && hash2(x+dx+dy, z+dz) < 0.5) continue;
+            const bx=x+dx, by=h+dy, bz=z+dz;
+            if(bx<0||bx>=W||bz<0||bz>=W||by>=H) continue;
+            if(world[idx(bx,by,bz)] === 0) world[idx(bx,by,bz)] = 7;
+          }
+        }
+      }
+    }
+  }
+}
+generateWorld();
+
+// ==================== 텍스처 아틀라스 ====================
+const atlasCanvas = document.createElement('canvas');
+atlasCanvas.width = 64; atlasCanvas.height = 64;
+const actx = atlasCanvas.getContext('2d');
+function shade(r,g,b,d){
+  const c = Math.max(0, Math.min(255, d|0));
+  return 'rgb(' + Math.min(255,r+c) + ',' + Math.min(255,g+c) + ',' + Math.min(255,b+c) + ')';
+}
+function fillTile(t, fn){
+  const ox = (t%4)*16, oy = Math.floor(t/4)*16;
+  for(let py=0; py<16; py++){
+    for(let px=0; px<16; px++){
+      actx.fillStyle = fn(px,py);
+      actx.fillRect(ox+px, oy+py, 1, 1);
+    }
+  }
+}
+function speck(base, amt, px, py){
+  const n = (hash2(px + 91*py + 1700*px*py, px*py + 31) - 0.5) * 2 * amt;
+  return shade(base[0], base[1], base[2], n);
+}
+fillTile(0,(px,py)=> speck([106,170,64], 24, px, py));                      // 잔디 위
+fillTile(1,(px,py)=> py<3 ? speck([106,170,64],20,px,py) : speck([134,96,67],22,px,py)); // 잔디 옆
+fillTile(2,(px,py)=> speck([134,96,67],24,px,py));                          // 흙
+fillTile(3,(px,py)=> speck([127,127,130],18,px,py));                        // 돌
+fillTile(4,(px,py)=>{ const d=((px%8===0)||(py%8===0)||(hash2(px,py)<0.18))?-30:0; return speck([120,120,122],16+d,px,py); }); // 조약돌
+fillTile(5,(px,py)=>{ const line = (py%4===3)?-38:(((px+ (py>>2)*5)%8===0)?-20:0); return speck([168,132,84],14+line,px,py); }); // 판자
+fillTile(6,(px,py)=>{ const s = ((px%4)<2)?-20:10; return speck([104,80,50],10+s,px,py); }); // 원목 옆
+fillTile(7,(px,py)=>{ const d=Math.sqrt((px-7.5)*(px-7.5)+(py-7.5)*(py-7.5)); const ring=((d|0)%3===0)?-25:0; return speck([140,110,70],12+ring,px,py); }); // 원목 위
+fillTile(8,(px,py)=>{ const dark = hash2(px*3+7,py*5+3)<0.25 ? -35 : (hash2(px,py+99)<0.15?20:0); return speck([56,124,38],18+dark,px,py); }); // 나뭇잎
+fillTile(9,(px,py)=> speck([219,206,160],16,px,py));                        // 모래
+fillTile(10,(px,py)=> speck([52,110,190],14,px,py));                        // 물
+fillTile(11,(px,py)=>{ const mortar = (py%4===0)||((px + (Math.floor(py/4)%2)*4)%8===0); return mortar? speck([188,180,170],8,px,py) : speck([150,72,60],14,px,py); }); // 벽돌
+
+// ==================== WebGL 초기화 ====================
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', {antialias:false});
+if(!gl){ document.getElementById('overlay').innerHTML = '<h1>WebGL 미지원</h1><p>이 브라우저는 WebGL을 지원하지 않습니다.</p>'; throw new Error('no webgl'); }
+
+function makeShader(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function makeProgram(vs, fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, makeShader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, makeShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+const blockVS = [
+  'attribute vec3 aPos; attribute vec2 aUV; attribute float aLight;',
+  'uniform mat4 uMVP;',
+  'varying vec2 vUV; varying float vLight; varying float vDist;',
+  'void main(){ gl_Position = uMVP * vec4(aPos,1.0); vUV=aUV; vLight=aLight; vDist=gl_Position.w; }'
+].join('\n');
+const blockFS = [
+  'precision mediump float;',
+  'uniform sampler2D uTex; uniform vec3 uFog; uniform float uFogNear; uniform float uFogFar; uniform float uAlpha;',
+  'varying vec2 vUV; varying float vLight; varying float vDist;',
+  'void main(){',
+  '  vec4 c = texture2D(uTex, vUV);',
+  '  float f = clamp((vDist-uFogNear)/(uFogFar-uFogNear), 0.0, 1.0);',
+  '  gl_FragColor = vec4(mix(c.rgb*vLight, uFog, f), uAlpha);',
+  '}'
+].join('\n');
+const lineVS = [
+  'attribute vec3 aPos; uniform mat4 uMVP; uniform vec3 uOffset;',
+  'void main(){ gl_Position = uMVP * vec4(aPos+uOffset, 1.0); }'
+].join('\n');
+const lineFS = [
+  'precision mediump float; uniform vec4 uColor;',
+  'void main(){ gl_FragColor = uColor; }'
+].join('\n');
+const blockProg = makeProgram(blockVS, blockFS);
+const lineProg = makeProgram(lineVS, lineFS);
+const bLoc = {
+  aPos: gl.getAttribLocation(blockProg,'aPos'),
+  aUV: gl.getAttribLocation(blockProg,'aUV'),
+  aLight: gl.getAttribLocation(blockProg,'aLight'),
+  uMVP: gl.getUniformLocation(blockProg,'uMVP'),
+  uTex: gl.getUniformLocation(blockProg,'uTex'),
+  uFog: gl.getUniformLocation(blockProg,'uFog'),
+  uFogNear: gl.getUniformLocation(blockProg,'uFogNear'),
+  uFogFar: gl.getUniformLocation(blockProg,'uFogFar'),
+  uAlpha: gl.getUniformLocation(blockProg,'uAlpha'),
+};
+const lLoc = {
+  aPos: gl.getAttribLocation(lineProg,'aPos'),
+  uMVP: gl.getUniformLocation(lineProg,'uMVP'),
+  uOffset: gl.getUniformLocation(lineProg,'uOffset'),
+  uColor: gl.getUniformLocation(lineProg,'uColor'),
+};
+
+const texture = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvas);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// ==================== 행렬 ====================
+const mat = new Float32Array(16);
+function matIdentity(m){ m.set([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); }
+function matMul(out,a,b){
+  const t = new Float32Array(16);
+  for(let c=0;c<4;c++) for(let r=0;r<4;r++){
+    t[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+  }
+  out.set(t);
+}
+function matPerspective(m, fov, aspect, near, far){
+  const f = 1/Math.tan(fov/2);
+  m.fill(0);
+  m[0]=f/aspect; m[5]=f; m[10]=(far+near)/(near-far); m[11]=-1; m[14]=2*far*near/(near-far);
+}
+function matRotX(m,a){
+  matIdentity(m); const c=Math.cos(a), s=Math.sin(a);
+  m[5]=c; m[6]=s; m[9]=-s; m[10]=c;
+}
+function matRotY(m,a){
+  matIdentity(m); const c=Math.cos(a), s=Math.sin(a);
+  m[0]=c; m[2]=-s; m[8]=s; m[10]=c;
+}
+function matTrans(m,x,y,z){
+  matIdentity(m); m[12]=x; m[13]=y; m[14]=z;
+}
+const tmpA = new Float32Array(16), tmpB = new Float32Array(16), proj = new Float32Array(16),
+      rx = new Float32Array(16), ry = new Float32Array(16), tr = new Float32Array(16), view = new Float32Array(16), mvp = new Float32Array(16);
+
+// ==================== 청크 메싱 ====================
+const FACES = [
+  {d:[0,1,0],  l:1.00, t:0, c:[[0,1,0,0,0],[0,1,1,0,1],[1,1,1,1,1],[1,1,0,1,0]]},
+  {d:[0,-1,0], l:0.50, t:2, c:[[0,0,0,0,0],[0,0,1,0,1],[1,0,1,1,1],[1,0,0,1,0]]},
+  {d:[-1,0,0], l:0.70, t:1, c:[[0,0,0,0,1],[0,1,0,0,0],[0,1,1,1,0],[0,0,1,1,1]]},
+  {d:[1,0,0],  l:0.70, t:1, c:[[1,0,0,0,1],[1,1,0,0,0],[1,1,1,1,0],[1,0,1,1,1]]},
+  {d:[0,0,-1], l:0.85, t:1, c:[[0,0,0,0,1],[0,1,0,0,0],[1,1,0,1,0],[1,0,0,1,1]]},
+  {d:[0,0,1],  l:0.85, t:1, c:[[0,0,1,0,1],[0,1,1,0,0],[1,1,1,1,0],[1,0,1,1,1]]},
+];
+function tileUV(tile,u,v){
+  return [ (tile%4 + u)/4, (Math.floor(tile/4) + v)/4 ];
+}
+const chunks = new Array(CX*CX).fill(null);
+function buildChunk(ci, cj){
+  const solid = [], water = [];
+  const x0 = ci*CS, z0 = cj*CS;
+  for(let x=x0; x<x0+CS; x++){
+    for(let z=z0; z<z0+CS; z++){
+      for(let y=0; y<H; y++){
+        const b = world[idx(x,y,z)];
+        if(b===0) continue;
+        const isWater = b===9;
+        const def = BLOCKS[b];
+        for(let fi=0; fi<6; fi++){
+          const f = FACES[fi];
+          const n = getBlock(x+f.d[0], y+f.d[1], z+f.d[2]);
+          let draw;
+          if(isWater) draw = (n===0);
+          else draw = (n===0 || n===9);
+          if(!draw) continue;
+          const tile = def.tiles[f.t];
+          const arr = isWater ? water : solid;
+          const verts = f.c;
+          for(let k=0; k<4; k++){
+            const vv = verts[k];
+            const uv = tileUV(tile, vv[3], vv[4]);
+            arr.push(x+vv[0], y+vv[1], z+vv[2], uv[0], uv[1], f.l);
+          }
+        }
+      }
+    }
+  }
+  const slot = chunks[ci+cj*CX] || (chunks[ci+cj*CX] = {sbuf:gl.createBuffer(), wbuf:gl.createBuffer(), scount:0, wcount:0});
+  gl.bindBuffer(gl.ARRAY_BUFFER, slot.sbuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(solid), gl.STATIC_DRAW);
+  slot.scount = solid.length/6;
+  gl.bindBuffer(gl.ARRAY_BUFFER, slot.wbuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(water), gl.STATIC_DRAW);
+  slot.wcount = water.length/6;
+}
+for(let ci=0; ci<CX; ci++) for(let cj=0; cj<CX; cj++) buildChunk(ci,cj);
+function setBlock(x,y,z,b){
+  if(x<0||x>=W||y<0||y>=H||z<0||z>=W) return;
+  world[idx(x,y,z)] = b;
+  const ci = (x/CS)|0, cj = (z/CS)|0;
+  buildChunk(ci,cj);
+  if(x%CS===0 && ci>0) buildChunk(ci-1,cj);
+  if(x%CS===CS-1 && ci<CX-1) buildChunk(ci+1,cj);
+  if(z%CS===0 && cj>0) buildChunk(ci,cj-1);
+  if(z%CS===CS-1 && cj<CX-1) buildChunk(ci,cj+1);
+}
+
+// ==================== 선택 와이어프레임 ====================
+const edgeVerts = (()=>{
+  const e = [], C = [[0,0,0],[1,0,0],[1,0,1],[0,0,1],[0,1,0],[1,1,0],[1,1,1],[0,1,1]];
+  const pairs = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+  const s = 0.004;
+  for(const [a,b] of pairs){
+    for(const v of [C[a],C[b]]) e.push(v[0]?1+s:-s, v[1]?1+s:-s, v[2]?1+s:-s);
+  }
+  return new Float32Array(e);
+})();
+const edgeBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, edgeBuf);
+gl.bufferData(gl.ARRAY_BUFFER, edgeVerts, gl.STATIC_DRAW);
+
+// ==================== 플레이어 ====================
+const player = {
+  pos: [W/2, 20, W/2],
+  vel: [0,0,0],
+  yaw: 0.6, pitch: -0.1,
+  onGround: false, fly: false,
+  halfW: 0.3, height: 1.8, eye: 1.62,
+};
+// 안전한 스폰 지점 찾기
+(function(){
+  for(let r=0; r<40; r++){
+    for(let a=0; a<16; a++){
+      const x = (W/2 + Math.cos(a/16*6.28)*r*2)|0;
+      const z = (W/2 + Math.sin(a/16*6.28)*r*2)|0;
+      if(x<2||x>=W-2||z<2||z>=W-2) continue;
+      for(let y=H-2; y>0; y--){
+        const b = getBlock(x,y,z);
+        if(b===0) continue;
+        if(b!==9 && y+3 < H){ player.pos = [x+0.5, y+1.2, z+0.5]; return; }
+        break;
+      }
+    }
+  }
+})();
+
+// ==================== 입력 ====================
+const keys = {};
+let locked = false;
+let slot = 0;
+const overlay = document.getElementById('overlay');
+function requestLock(){ canvas.requestPointerLock && canvas.requestPointerLock(); }
+document.getElementById('playBtn').addEventListener('click', requestLock);
+overlay.addEventListener('click', requestLock);
+document.addEventListener('pointerlockchange', ()=>{
+  locked = document.pointerLockElement === canvas;
+  overlay.classList.toggle('hidden', locked);
+  if(locked) overlay.classList.add('hidden'); else overlay.classList.remove('hidden');
+});
+document.addEventListener('mousemove', (e)=>{
+  if(!locked) return;
+  const dx = Math.max(-200, Math.min(200, e.movementX));
+  const dy = Math.max(-200, Math.min(200, e.movementY));
+  player.yaw += dx * 0.0024;
+  player.pitch -= dy * 0.0024;
+  player.pitch = Math.max(-1.55, Math.min(1.55, player.pitch));
+});
+document.addEventListener('keydown', (e)=>{
+  keys[e.code] = true;
+  if(e.code === 'KeyF'){ player.fly = !player.fly; player.vel[1] = 0; }
+  if(e.code.startsWith('Digit')){
+    const n = parseInt(e.code.slice(5),10);
+    if(n>=1 && n<=9){ slot = n-1; updateHotbar(); }
+  }
+  if(e.code === 'Space') e.preventDefault();
+});
+document.addEventListener('keyup', (e)=>{ keys[e.code] = false; });
+document.addEventListener('wheel', (e)=>{
+  if(!locked) return;
+  slot = (slot + (e.deltaY>0?1:-1) + 9) % 9;
+  updateHotbar();
+});
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+document.addEventListener('mousedown', (e)=>{
+  if(!locked) return;
+  if(e.button===0) breakBlock();
+  else if(e.button===2) placeBlock();
+});
+
+// ==================== 레이캐스트 ====================
+function raycast(){
+  const cp = Math.cos(player.pitch), sp = Math.sin(player.pitch);
+  const cy = Math.cos(player.yaw), sy = Math.sin(player.yaw);
+  const dir = [sy*cp, sp, -cy*cp];
+  const o = [player.pos[0], player.pos[1]+player.eye, player.pos[2]];
+  let x = Math.floor(o[0]), y = Math.floor(o[1]), z = Math.floor(o[2]);
+  const step = [Math.sign(dir[0]), Math.sign(dir[1]), Math.sign(dir[2])];
+  const tDelta = [Math.abs(1/(dir[0]||1e-9)), Math.abs(1/(dir[1]||1e-9)), Math.abs(1/(dir[2]||1e-9))];
+  const tMax = [
+    (dir[0]>0 ? (x+1-o[0]) : (o[0]-x)) * tDelta[0],
+    (dir[1]>0 ? (y+1-o[1]) : (o[1]-y)) * tDelta[1],
+    (dir[2]>0 ? (z+1-o[2]) : (o[2]-z)) * tDelta[2],
+  ];
+  let prev = null;
+  for(let i=0; i<128; i++){
+    const b = getBlock(x,y,z);
+    if(b!==0 && b!==9){
+      return {hit:true, block:[x,y,z], prev, type:b};
+    }
+    prev = [x,y,z];
+    let axis = 0;
+    if(tMax[1] < tMax[axis]) axis = 1;
+    if(tMax[2] < tMax[axis]) axis = 2;
+    if(tMax[axis] > REACH) break;
+    if(axis===0) x += step[0]; else if(axis===1) y += step[1]; else z += step[2];
+    tMax[axis] += tDelta[axis];
+  }
+  return {hit:false};
+}
+function breakBlock(){
+  const r = raycast();
+  if(!r.hit) return;
+  if(r.block[1] <= 0) return;
+  setBlock(r.block[0], r.block[1], r.block[2], 0);
+}
+function placeBlock(){
+  const r = raycast();
+  if(!r.hit || !r.prev) return;
+  const [x,y,z] = r.prev;
+  const cur = getBlock(x,y,z);
+  if(cur!==0 && cur!==9) return;
+  const b = HOTBAR[slot];
+  // 플레이어 몸과 겹치면 설치 금지
+  const p = player.pos;
+  if(x+1 > p[0]-player.halfW && x < p[0]+player.halfW &&
+     z+1 > p[2]-player.halfW && z < p[2]+player.halfW &&
+     y+1 > p[1] && y < p[1]+player.height) return;
+  setBlock(x,y,z,b);
+}
+
+// ==================== 물리 ====================
+function moveAxis(axis, delta){
+  const p = player.pos;
+  p[axis] += delta;
+  const min = [p[0]-player.halfW, p[1], p[2]-player.halfW];
+  const max = [p[0]+player.halfW, p[1]+player.height, p[2]+player.halfW];
+  const e = 0.001;
+  for(let bx=Math.floor(min[0]); bx<=Math.floor(max[0]); bx++){
+    for(let by=Math.floor(min[1]); by<=Math.floor(max[1]); by++){
+      for(let bz=Math.floor(min[2]); bz<=Math.floor(max[2]); bz++){
+        if(!solidAt(bx,by,bz)) continue;
+        if(axis===0){
+          p[0] = delta>0 ? bx-player.halfW-e : bx+1+player.halfW+e;
+          player.vel[0]=0; return true;
+        } else if(axis===1){
+          if(delta>0){ p[1] = by-player.height-e; }
+          else { p[1] = by+1+e; player.onGround = true; }
+          player.vel[1]=0; return true;
+        } else {
+          p[2] = delta>0 ? bz-player.halfW-e : bz+1+player.halfW+e;
+          player.vel[2]=0; return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+function inWater(){
+  const p = player.pos;
+  return getBlock(Math.floor(p[0]), Math.floor(p[1]+0.4), Math.floor(p[2]))===9;
+}
+function updatePlayer(dt){
+  const p = player.pos, v = player.vel;
+  const sprint = keys['ShiftLeft'] && !player.fly;
+  const speed = player.fly ? 11 : (sprint ? 6.2 : 4.4);
+  let fwd = 0, str = 0;
+  if(keys['KeyW']) fwd += 1;
+  if(keys['KeyS']) fwd -= 1;
+  if(keys['KeyD']) str += 1;
+  if(keys['KeyA']) str -= 1;
+  const sy = Math.sin(player.yaw), cy = Math.cos(player.yaw);
+  let mx = fwd*sy + str*cy;
+  let mz = fwd*(-cy) + str*sy;
+  const len = Math.hypot(mx,mz);
+  if(len>0){ mx = mx/len*speed; mz = mz/len*speed; }
+  v[0] = mx; v[2] = mz;
+
+  const water = inWater();
+  if(player.fly){
+    v[1] = 0;
+    if(keys['Space']) v[1] = 8;
+    if(keys['ShiftLeft']) v[1] = -8;
+  } else if(water){
+    v[1] += -6*dt;
+    if(keys['Space']) v[1] = 3.2;
+    v[1] = Math.max(v[1], -3);
+  } else {
+    v[1] -= 28*dt;
+    v[1] = Math.max(v[1], -50);
+    if(keys['Space'] && player.onGround) v[1] = 8.5;
+  }
+
+  player.onGround = false;
+  moveAxis(0, v[0]*dt);
+  moveAxis(2, v[2]*dt);
+  moveAxis(1, v[1]*dt);
+  // 월드 밖으로 나가지 못하게
+  p[0] = Math.max(0.4, Math.min(W-0.4, p[0]));
+  p[2] = Math.max(0.4, Math.min(W-0.4, p[2]));
+  if(p[1] < -20){ p[1] = H; v[1] = 0; }
+}
+
+// ==================== UI ====================
+const hotbarEl = document.getElementById('hotbar');
+const slotEls = [];
+HOTBAR.forEach((b, i)=>{
+  const div = document.createElement('div');
+  div.className = 'slot' + (i===0?' sel':'');
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 16;
+  const g = c.getContext('2d');
+  g.imageSmoothingEnabled = false;
+  const tile = BLOCKS[b].tiles[1];
+  g.drawImage(atlasCanvas, (tile%4)*16, Math.floor(tile/4)*16, 16, 16, 0, 0, 16, 16);
+  const num = document.createElement('span');
+  num.textContent = (i+1);
+  div.appendChild(c); div.appendChild(num);
+  div.title = BLOCKS[b].name;
+  hotbarEl.appendChild(div);
+  slotEls.push(div);
+});
+function updateHotbar(){
+  slotEls.forEach((el,i)=> el.classList.toggle('sel', i===slot));
+}
+const infoEl = document.getElementById('info');
+
+// ==================== 렌더 루프 ====================
+function resize(){
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  gl.viewport(0,0,canvas.width,canvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const SKY = [0.62, 0.8, 0.98];
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.05, (now-last)/1000);
+  last = now;
+  if(locked) updatePlayer(dt);
+
+  const p = player.pos;
+  const underwater = getBlock(Math.floor(p[0]), Math.floor(p[1]+player.eye), Math.floor(p[2]))===9;
+  const fog = underwater ? [0.08,0.25,0.5] : SKY;
+  const fogNear = underwater ? 2 : 60;
+  const fogFar = underwater ? 16 : 100;
+
+  gl.clearColor(fog[0], fog[1], fog[2], 1);
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  matPerspective(proj, 1.25, canvas.width/canvas.height, 0.08, 300);
+  matRotX(rx, player.pitch);
+  matRotY(ry, player.yaw);
+  matTrans(tr, -p[0], -(p[1]+player.eye), -p[2]);
+  matMul(view, rx, ry);
+  matMul(tmpA, view, tr);
+  matMul(mvp, proj, tmpA);
+
+  gl.useProgram(blockProg);
+  gl.uniformMatrix4fv(bLoc.uMVP, false, mvp);
+  gl.uniform3f(bLoc.uFog, fog[0], fog[1], fog[2]);
+  gl.uniform1f(bLoc.uFogNear, fogNear);
+  gl.uniform1f(bLoc.uFogFar, fogFar);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.uniform1i(bLoc.uTex, 0);
+
+  gl.enableVertexAttribArray(bLoc.aPos);
+  gl.enableVertexAttribArray(bLoc.aUV);
+  gl.enableVertexAttribArray(bLoc.aLight);
+
+  // 불투명 패스
+  gl.disable(gl.BLEND);
+  gl.depthMask(true);
+  gl.uniform1f(bLoc.uAlpha, 1.0);
+  for(let i=0; i<chunks.length; i++){
+    const ch = chunks[i];
+    if(!ch || ch.scount===0) continue;
+    gl.bindBuffer(gl.ARRAY_BUFFER, ch.sbuf);
+    gl.vertexAttribPointer(bLoc.aPos, 3, gl.FLOAT, false, 24, 0);
+    gl.vertexAttribPointer(bLoc.aUV, 2, gl.FLOAT, false, 24, 12);
+    gl.vertexAttribPointer(bLoc.aLight, 1, gl.FLOAT, false, 24, 20);
+    gl.drawArrays(gl.TRIANGLES, 0, ch.scount);
+  }
+  // 물 패스
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.depthMask(false);
+  gl.uniform1f(bLoc.uAlpha, 0.65);
+  for(let i=0; i<chunks.length; i++){
+    const ch = chunks[i];
+    if(!ch || ch.wcount===0) continue;
+    gl.bindBuffer(gl.ARRAY_BUFFER, ch.wbuf);
+    gl.vertexAttribPointer(bLoc.aPos, 3, gl.FLOAT, false, 24, 0);
+    gl.vertexAttribPointer(bLoc.aUV, 2, gl.FLOAT, false, 24, 12);
+    gl.vertexAttribPointer(bLoc.aLight, 1, gl.FLOAT, false, 24, 20);
+    gl.drawArrays(gl.TRIANGLES, 0, ch.wcount);
+  }
+  gl.depthMask(true);
+  gl.disable(gl.BLEND);
+
+  // 선택 하이라이트
+  const r = raycast();
+  if(r.hit){
+    gl.useProgram(lineProg);
+    gl.uniformMatrix4fv(lLoc.uMVP, false, mvp);
+    gl.uniform3f(lLoc.uOffset, r.block[0], r.block[1], r.block[2]);
+    gl.uniform4f(lLoc.uColor, 0, 0, 0, 0.8);
+    gl.bindBuffer(gl.ARRAY_BUFFER, edgeBuf);
+    gl.enableVertexAttribArray(lLoc.aPos);
+    gl.vertexAttribPointer(lLoc.aPos, 3, gl.FLOAT, false, 12, 0);
+    gl.drawArrays(gl.LINES, 0, 24);
+  }
+
+  infoEl.textContent = 'x:' + p[0].toFixed(1) + ' y:' + p[1].toFixed(1) + ' z:' + p[2].toFixed(1) +
+    (player.fly ? '  [비행 모드]' : '') + (underwater ? '  [물속]' : '');
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
